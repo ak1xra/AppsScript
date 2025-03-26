@@ -1,0 +1,328 @@
+// Notionの統合トークンとデータベースIDを設定してください
+var NOTION_TOKEN = "NOTION_API_TOKEN"; // Notion_API_Token
+var NOTION_DATABASE_ID = "NOTION_DATABASE_ID"; // Notion_Database_ID
+
+/**
+ * pubDate文字列をISO形式(YYYY-MM-DD)に変換するヘルパー関数
+ * 変換に失敗した場合はnullを返します。
+ * @param {string} pubDate
+ * @return {string|null}
+ */
+function convertPubDateToISO(pubDate) {
+  var dateObj = new Date(pubDate);
+  if (isNaN(dateObj.getTime())) {
+    return null;
+  } else {
+    return dateObj.toISOString().split('T')[0];
+  }
+}
+
+/**
+ * efetch APIを用いて指定したPMIDの記事のAbstract（要約）を取得する関数
+ * @param {string|number} pmid
+ * @return {string} Abstractのテキスト（存在しない場合は空文字）
+ */
+function getAbstractForPMID(pmid) {
+  var efetchUrl = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi" +
+                  "?db=pubmed&id=" + pmid +
+                  "&retmode=xml";
+  var response = UrlFetchApp.fetch(efetchUrl);
+  var xml = response.getContentText();
+  
+  try {
+    var document = XmlService.parse(xml);
+    var root = document.getRootElement();
+    // PubmedArticleSet > PubmedArticle > MedlineCitation > Article > Abstract > AbstractText
+    var articles = root.getChildren("PubmedArticle");
+    if (articles.length === 0) return "";
+    
+    var article = articles[0];
+    var medlineCitation = article.getChild("MedlineCitation");
+    if (!medlineCitation) return "";
+    var articleInfo = medlineCitation.getChild("Article");
+    if (!articleInfo) return "";
+    var abstractObj = articleInfo.getChild("Abstract");
+    if (!abstractObj) return "";
+    
+    // AbstractTextは複数存在する場合もあるので、全てのテキストを結合
+    var abstractTexts = abstractObj.getChildren("AbstractText");
+    var abstractCombined = abstractTexts.map(function(el) {
+      return el.getText();
+    }).join("\n");
+    return abstractCombined;
+  } catch (e) {
+    Logger.log("XMLのパースに失敗しました: " + e);
+    return "";
+  }
+}
+
+/**
+ * スプレッドシート内のクエリをすべて取得し、PubMedから記事情報を取得してNotionへ送信するメイン関数
+ */
+function fetchAllPubMedQueries() {
+  // ▼ 書き込み先のスプレッドシートIDを指定
+  var ss = SpreadsheetApp.openById("Spreadshhe_ID"); // Spreadshhe_ID
+  
+  // ▼ クエリ一覧を格納したシート名
+  var queriesSheetName = "Queries";
+  var queriesSheet = ss.getSheetByName(queriesSheetName);
+  if (!queriesSheet) {
+    Logger.log("Queriesシートが存在しません。作成してください。");
+    return;
+  }
+
+  // ▼ A列に書かれたクエリをすべて取得
+  var lastRow = queriesSheet.getLastRow();
+  if (lastRow < 1) {
+    Logger.log("Queriesシートにクエリがありません。");
+    return;
+  }
+  
+  // A列の値をまとめて取得 (2次元配列)
+  var queryValues = queriesSheet.getRange(1, 1, lastRow, 1).getValues();
+  
+  // ▼ 各行のクエリをループして実行
+  for (var i = 0; i < queryValues.length; i++) {
+    var query = queryValues[i][0];
+    if (!query || query.trim() === "") {
+      // 空行はスキップ
+      continue;
+    }
+    
+    // Notionに送信するためのPubMed記事情報を取得
+    fetchAndSendPubMedArticles(query);
+  }
+  
+  Logger.log("全てのクエリの処理が完了しました。");
+}
+
+/**
+ * 指定したクエリでPubMed検索を行い、Notionのデータベースに記事情報を送信するサブ関数
+ * @param {string} query 検索クエリ
+ */
+function fetchAndSendPubMedArticles(query) {
+  // ▼ 新着順で最大50件を取得 (必要に応じて retmax=○○ を変更)
+  var esearchUrl = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi" +
+                   "?db=pubmed" +
+                   "&term=" + encodeURIComponent(query) +
+                   "&sort=recent" +
+                   "&retmode=json" +
+                   "&retmax=50";      
+
+  var esearchResponse = UrlFetchApp.fetch(esearchUrl);
+  var esearchData = JSON.parse(esearchResponse.getContentText());
+  var idList = esearchData.esearchresult.idlist;
+  
+  // ▼ 該当なしの場合はNotionに「結果なし」として送信
+  if (!idList || idList.length === 0) {
+    Logger.log("クエリ: [" + query + "] の該当文献はありませんでした。");
+    sendNoResultsToNotion(query);
+    return;
+  }
+
+  // ▼ eSummary API で詳細情報をまとめて取得
+  var idsParam = idList.join(",");
+  var esummaryUrl = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi" +
+                    "?db=pubmed" +
+                    "&id=" + idsParam +
+                    "&retmode=json";
+
+  var esummaryResponse = UrlFetchApp.fetch(esummaryUrl);
+  var esummaryResult = JSON.parse(esummaryResponse.getContentText()).result;
+
+  // ▼ 取得したPMIDごとにNotionに送信
+  idList.forEach(function(pmid) {
+    var article = esummaryResult[pmid];
+    if (!article) return;
+    
+    var title   = article.title || "";
+    var authors = (article.authors && article.authors.length > 0)
+                  ? article.authors.map(function(a) { return a.name; }).join(", ")
+                  : "";
+    var pubDate = article.pubdate || "";
+    var journal = article.fulljournalname || "";
+
+    // PubMedページへのURL
+    var pubmedUrl = "https://pubmed.ncbi.nlm.nih.gov/" + pmid + "/";
+
+    // DOI取得
+    var doi = "";
+    var doiUrl = "";
+    
+    // 1) eSummaryのトップレベルにある "elocationid" を確認
+    if (article.elocationid && article.elocationid.indexOf("doi: ") === 0) {
+      doi = article.elocationid.replace("doi: ", "").trim();
+    } else if (article.elocationid) {
+      doi = article.elocationid;
+    }
+
+    // 2) "articleids" 配列を走査
+    if (article.articleids && Array.isArray(article.articleids)) {
+      var doiItem = article.articleids.find(function(item) {
+        return item.idtype === "doi";
+      });
+      if (doiItem && doiItem.value) {
+        doi = doiItem.value;
+      }
+    }
+    
+    // DOI → DOI URL
+    if (doi) {
+      doi = doi.replace(/^doi:\s*/i, "").trim();
+      doiUrl = "https://doi.org/" + doi;
+    }
+    
+    // 追加：efetch APIを利用してAbstractを取得
+    var abstractText = getAbstractForPMID(pmid);
+
+    // Notionへ記事情報を送信するためのデータオブジェクトを作成
+    var articleData = {
+      pmid: Number(pmid),  // 数値型に変換
+      title: title,
+      authors: authors,
+      pubDate: pubDate,
+      journal: journal,
+      pubmedUrl: pubmedUrl,
+      doi: doi,
+      doiUrl: doiUrl,
+      abstract: abstractText
+    };
+    sendArticleToNotion(articleData);
+  });
+
+  Logger.log("クエリ: [" + query + "] の処理が完了しました。");
+}
+
+/**
+ * PubMed記事情報をNotionのデータベースに送信する関数
+ * @param {Object} articleData 記事データオブジェクト
+ */
+function sendArticleToNotion(articleData) {
+  var url = "https://api.notion.com/v1/pages";
+  var payload = {
+    parent: { database_id: NOTION_DATABASE_ID },
+    properties: {
+      "PMID": {
+        number: articleData.pmid  // 数値型プロパティ
+      },
+      "Title": {
+        title: [
+          {
+            text: { content: articleData.title }
+          }
+        ]
+      },
+      "Authors": {
+        rich_text: [
+          {
+            text: { content: articleData.authors }
+          }
+        ]
+      },
+      "Publication Date": {
+        date: {
+          start: convertPubDateToISO(articleData.pubDate)
+        }
+      },
+      "Journal": {
+        rich_text: [
+          {
+            text: { content: articleData.journal }
+          }
+        ]
+      },
+      "PubMed URL": {
+        url: articleData.pubmedUrl
+      },
+      "DOI": {
+        rich_text: [
+          {
+            text: { content: articleData.doi }
+          }
+        ]
+      },
+      "DOI URL": {
+        url: articleData.doiUrl
+      },
+      // 新たにAbstractプロパティを追加（Notion側でrich_text型として設定しておく）
+      "Abstract": {
+        rich_text: [
+          {
+            text: { content: articleData.abstract }
+          }
+        ]
+      }
+    }
+  };
+
+  var options = {
+    method: "post",
+    contentType: "application/json",
+    headers: {
+      "Authorization": "Bearer " + NOTION_TOKEN,
+      "Notion-Version": "2022-06-28"
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  var response = UrlFetchApp.fetch(url, options);
+  Logger.log("Notion response: " + response.getContentText());
+}
+
+/**
+ * クエリに該当する記事がなかった場合、Notionにその旨を送信する関数
+ * @param {string} query 検索クエリ
+ */
+function sendNoResultsToNotion(query) {
+  var url = "https://api.notion.com/v1/pages";
+  var payload = {
+    parent: { database_id: NOTION_DATABASE_ID },
+    properties: {
+      "PMID": {
+        number: 0  // 数値型の適当な値を設定
+      },
+      "Title": {
+        title: [
+          {
+            text: { content: "No Results" }
+          }
+        ]
+      },
+      "Authors": {
+        rich_text: [
+          {
+            text: { content: "クエリ: " + query + " に該当する文献はありませんでした。" }
+          }
+        ]
+      },
+      "Publication Date": {
+        date: {
+          start: null
+        }
+      },
+      "Abstract": {
+        rich_text: [
+          {
+            text: { content: "" }
+          }
+        ]
+      }
+      // 必要に応じて他のプロパティを追加可能
+    }
+  };
+
+  var options = {
+    method: "post",
+    contentType: "application/json",
+    headers: {
+      "Authorization": "Bearer " + NOTION_TOKEN,
+      "Notion-Version": "2022-06-28"
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  var response = UrlFetchApp.fetch(url, options);
+  Logger.log("Notion response (No Results): " + response.getContentText());
+}
