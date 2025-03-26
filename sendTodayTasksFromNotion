@@ -1,0 +1,121 @@
+function sendTodayTasksFromNotion() {
+  // ★★★ 必要に応じてトークンやDB IDなどを変更してください ★★★
+  var NOTION_TOKEN   = 'NOTION_API_TOKEN'; // NotionのAPIトークン
+  var TASK_DB_ID     = 'TASK_DATABASE_ID'; // タスクデータベースのID  (https://www.notion.so/xxxxx?v=yyy から取得)
+  var NOTION_VERSION = '2022-06-28';
+  var toEmail        = '送信先メールアドレス'; // 送信先メールアドレス
+
+  // 今日の日付文字列 (YYYY-MM-DD)
+  var today = new Date();
+  var year  = today.getFullYear();
+  var month = ('0' + (today.getMonth() + 1)).slice(-2);
+  var day   = ('0' + today.getDate()).slice(-2);
+  var todayStr = year + '-' + month + '-' + day;
+
+  // Notion APIに送るリクエストボディ (フィルタ + ソート)
+  var requestBody = {
+    filter: {
+      property: "実行日", // Notion上のプロパティ名が "Date" か要確認
+      date: {
+        equals: todayStr
+      }
+    },
+    sorts: [
+      {
+        property: "Time-Box", // "Time-Box" というプロパティが実在するか要確認
+        direction: "ascending"
+      }
+    ]
+  };
+
+  // API呼び出し設定
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': 'Bearer ' + NOTION_TOKEN,
+      'Notion-Version': NOTION_VERSION
+    },
+    payload: JSON.stringify(requestBody)
+  };
+
+  var notionUrl = 'https://api.notion.com/v1/databases/' + TASK_DB_ID + '/query';
+  var response = UrlFetchApp.fetch(notionUrl, options);
+
+  // 必要に応じてレスポンスの中身をログ出力して確認
+  // Logger.log(response.getContentText());
+
+  var json = JSON.parse(response.getContentText());
+  if (!json.results) {
+    // エラー or 該当なし
+    Logger.log("Notion APIからの取得結果が不正です: " + JSON.stringify(json));
+    return;
+  }
+
+  // タスクをTime-Boxごとに分類する連想配列
+  var groupedTasks = {};
+
+  // API結果を走査し、必要な情報だけ抜き出す
+  json.results.forEach(function(page) {
+    var props = page.properties;
+
+    // Time-Box
+    var timeBox = (props["Time-Box"] && props["Time-Box"].select)
+      ? props["Time-Box"].select.name
+      : "No Time-Box";
+
+    // 優先度
+    var priority = (props["優先度"] && props["優先度"].select)
+      ? props["優先度"].select.name
+      : "No Priority";
+
+    // タスク (title型)
+    var taskName = (props["タスク"] 
+                    && props["タスク"].title 
+                    && props["タスク"].title[0])
+      ? props["タスク"].title[0].plain_text
+      : "No Task Name";
+
+    // プロジェクトは削除するとのことなので取得・表示しない
+
+    // グルーピング
+    if (!groupedTasks[timeBox]) {
+      groupedTasks[timeBox] = [];
+    }
+    groupedTasks[timeBox].push({
+      priority: priority,
+      task: taskName
+    });
+  });
+
+  // --- メール本文をHTMLで組み立て (リッチテキスト) ---
+  // ※ ここでは4カラム→3カラムに変更 (Time-Box, 優先度, タスク)
+  var htmlBody = '<p>今日のタスクは以下の通りです。</p>';
+  htmlBody += '<table border="1" style="border-collapse:collapse;">';
+  htmlBody += '<tr><th style="padding:4px;">Time-Box</th><th style="padding:4px;">優先度</th><th style="padding:4px;">タスク</th></tr>';
+
+  // Time-Boxのキー名でソートしながら表を埋める
+  Object.keys(groupedTasks).sort().forEach(function(timeBox) {
+    var tasks = groupedTasks[timeBox];
+    tasks.forEach(function(t) {
+      htmlBody += '<tr>';
+      htmlBody += '<td style="padding:4px;">' + timeBox + '</td>';
+      htmlBody += '<td style="padding:4px;">' + t.priority + '</td>';
+      htmlBody += '<td style="padding:4px;">' + t.task + '</td>';
+      htmlBody += '</tr>';
+    });
+  });
+
+  htmlBody += '</table>';
+
+  // Gmailに送る (HTMLメール)
+  var subject = "【Notion通知】今日のタスク";
+  MailApp.sendEmail({
+    to: toEmail,
+    subject: subject,
+    // body はテキストメールとしてのフォールバック
+    body: "HTML形式でタスク内容を送信しています。",
+    // リッチテキストメール本文
+    htmlBody: htmlBody
+  });
+}
